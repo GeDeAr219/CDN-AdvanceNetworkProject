@@ -1,9 +1,13 @@
 
+from collections import OrderedDict
+
+
 class PopularityCache:
 
     def __init__(self, capacity=3):
         self.capacity = capacity
-        self.cache = {}
+        # Ordered from least to most recently used
+        self.cache = OrderedDict()
         self.frequency = {}
 
     def get(self, key):
@@ -13,19 +17,25 @@ class PopularityCache:
 
         # Increase access frequency
         self.frequency[key] += 1
+        self.cache.move_to_end(key)
 
         return self.cache[key]
 
     def put(self, key, value):
 
+        if self.capacity <= 0:
+            return
+
         if key in self.cache:
             self.cache[key] = value
+            self.cache.move_to_end(key)
             return
 
         # Check if cache is full
         if len(self.cache) >= self.capacity:
 
-            # Find the least frequently used file
+            # Find the least frequently used file;
+            # min() picks the least recently used one on ties
             least_popular = min(
                 self.cache,
                 key=lambda k: self.frequency[k]

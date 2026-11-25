@@ -1,4 +1,6 @@
 
+import csv
+import sys
 import time
 from pathlib import Path
 
@@ -12,6 +14,13 @@ from flask import (
     send_from_directory
 )
 
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+
+# Make the edge server modules importable
+sys.path.insert(0, str(PROJECT_DIR / "edge"))
+
+from app_edge import CACHE_CAPACITY, FILES
+
 app = Flask(__name__)
 
 # =====================================
@@ -20,11 +29,9 @@ app = Flask(__name__)
 
 EDGE_URL = "http://127.0.0.1:5001"
 
-FILES = ["a.bin", "b.bin", "c.bin", "d.bin"]
+RESULTS_DIR = PROJECT_DIR / "results"
 
-RESULTS_DIR = (
-    Path(__file__).resolve().parent.parent / "results"
-)
+CSV_FILE = RESULTS_DIR / "results_with_baseline.csv"
 
 CHART_FILES = {
     "hit_rate_baseline.png",
@@ -386,8 +393,6 @@ HTML = """
         {% endif %}
 
 
-        <!-- NEW: EVICTION DETECTION -->
-
         {% if evicted %}
 
         <div class="eviction-alert">
@@ -599,8 +604,6 @@ HTML = """
         {% endif %}
 
 
-        <!-- IMPORTANT: ["items"] FIX -->
-
         {% if cache_info["items"] %}
 
         <div class="cache-grid">
@@ -665,8 +668,8 @@ HTML = """
 
         <p>
             File Size: 256 KiB |
-            Cache Capacity: 3 Files |
-            Repetitions: 3
+            Cache Capacity: {{ cache_capacity }} Files |
+            Repetitions: {{ repetitions }}
         </p>
 
 
@@ -745,37 +748,67 @@ HTML = """
 
 
 # =====================================
+# EDGE SERVER ACCESS
+# =====================================
+
+EDGE_ERROR = "Edge server unavailable or returned an invalid response"
+
+
+def get_edge_json(path):
+
+    response = requests.get(
+        f"{EDGE_URL}{path}",
+        timeout=10
+    )
+
+    response.raise_for_status()
+    return response.json()
+
+
+# =====================================
+# EXPERIMENT RESULTS
+# =====================================
+
+def get_repetitions():
+
+    # Taken from the saved results, so it matches the measured data
+    try:
+        with open(CSV_FILE, newline="", encoding="utf-8") as file:
+            return max(int(row["run"]) for row in csv.DictReader(file))
+
+    except (OSError, KeyError, ValueError):
+        return "N/A"
+
+
+# =====================================
 # DASHBOARD MAIN PAGE
 # =====================================
 
 @app.route("/")
 def dashboard():
 
-    # Get performance statistics
-    response = requests.get(
-        f"{EDGE_URL}/stats",
-        timeout=10
-    )
+    try:
+        # Get performance statistics
+        stats = get_edge_json("/stats")
 
-    response.raise_for_status()
-    stats = response.json()
+        # Get current cache contents
+        cache_info = get_edge_json("/cache")
 
-    # Get current cache contents
-    cache_response = requests.get(
-        f"{EDGE_URL}/cache",
-        timeout=10
-    )
-
-    cache_response.raise_for_status()
-    cache_info = cache_response.json()
+    except (requests.RequestException, ValueError):
+        return (
+            f"<h1>Tiny CDN Dashboard</h1><p>{EDGE_ERROR}.</p>"
+            '<p><a href="/">Retry</a></p>'
+        ), 503
 
     # Calculate origin request ratio
     total = stats["total_requests"]
 
     if total > 0:
-        origin_ratio = (
-            stats["origin_requests"] / total
-        ) * 100
+        # Failed origin requests are not in total, so cap at 100
+        origin_ratio = min(
+            (stats["origin_requests"] / total) * 100,
+            100
+        )
     else:
         origin_ratio = 0
 
@@ -783,6 +816,8 @@ def dashboard():
         HTML,
         stats=stats,
         files=FILES,
+        cache_capacity=CACHE_CAPACITY,
+        repetitions=get_repetitions(),
         cache_info=cache_info,
         origin_ratio=round(origin_ratio, 2),
         message=request.args.get("message", ""),
@@ -803,45 +838,37 @@ def fetch_file():
     if filename not in FILES:
         return {"error": "Invalid file"}, 400
 
-    # Cache contents BEFORE the request
-    before_response = requests.get(
-        f"{EDGE_URL}/cache",
-        timeout=10
-    )
+    try:
+        # Cache contents BEFORE the request
+        before_data = get_edge_json("/cache")
 
-    before_response.raise_for_status()
-    before_data = before_response.json()
+        # Send HTTP request and measure latency
+        start = time.perf_counter()
+
+        response = requests.get(
+            f"{EDGE_URL}/content/{filename}",
+            timeout=15
+        )
+
+        latency = (
+            time.perf_counter() - start
+        ) * 1000
+
+        # Cache contents AFTER the request
+        after_data = get_edge_json("/cache")
+
+    except (requests.RequestException, ValueError):
+        return redirect(url_for("dashboard", message=EDGE_ERROR))
 
     before_files = {
         item["filename"]
         for item in before_data["items"]
     }
 
-    # Send HTTP request and measure latency
-    start = time.perf_counter()
-
-    response = requests.get(
-        f"{EDGE_URL}/content/{filename}",
-        timeout=15
-    )
-
-    latency = (
-        time.perf_counter() - start
-    ) * 1000
-
     cache_status = response.headers.get(
         "X-Cache",
         "N/A"
     )
-
-    # Cache contents AFTER the request
-    after_response = requests.get(
-        f"{EDGE_URL}/cache",
-        timeout=10
-    )
-
-    after_response.raise_for_status()
-    after_data = after_response.json()
 
     after_files = {
         item["filename"]
@@ -884,18 +911,23 @@ def reset():
     if policy not in ("none", "lru", "popularity"):
         return {"error": "Invalid policy"}, 400
 
-    response = requests.post(
-        f"{EDGE_URL}/admin/reset",
-        json={"policy": policy},
-        timeout=10
-    )
+    try:
+        response = requests.post(
+            f"{EDGE_URL}/admin/reset",
+            json={"policy": policy},
+            timeout=10
+        )
 
-    response.raise_for_status()
+        response.raise_for_status()
+        message = f"Policy changed to {policy}"
+
+    except requests.RequestException:
+        message = EDGE_ERROR
 
     return redirect(
         url_for(
             "dashboard",
-            message=f"Policy changed to {policy}"
+            message=message
         )
     )
 
@@ -925,5 +957,5 @@ if __name__ == "__main__":
     app.run(
         host="127.0.0.1",
         port=5002,
-        debug=True
+        debug=False
     )

@@ -1,4 +1,7 @@
 
+import threading
+from urllib.parse import quote
+
 from flask import Flask, Response, request
 from lru import LRUCache
 from popularity import PopularityCache
@@ -11,6 +14,9 @@ ORIGIN_URL = "http://127.0.0.1:5000"
 # Available policies: "lru", "popularity", "none"
 CACHE_POLICY = "popularity"
 CACHE_CAPACITY = 3
+
+# Test files offered by the dashboard (see Origin/generate_files.py)
+FILES = ["a.bin", "b.bin", "c.bin", "d.bin"]
 
 # Performance statistics
 stats = {
@@ -42,6 +48,23 @@ def create_cache(policy):
 
 cache = create_cache(CACHE_POLICY)
 
+# Guards cache, CACHE_POLICY, stats and generation
+lock = threading.Lock()
+
+# Incremented on every reset, so older in-flight requests are ignored
+generation = 0
+
+
+def is_safe_filename(filename):
+
+    if "\\" in filename or not filename.isprintable():
+        return False
+
+    return all(
+        part not in ("", ".", "..")
+        for part in filename.split("/")
+    )
+
 
 # =====================================
 # CONTENT REQUEST
@@ -50,16 +73,30 @@ cache = create_cache(CACHE_POLICY)
 @app.route("/content/<path:filename>")
 def get_content(filename):
 
-    # Check whether caching is enabled
-    if CACHE_POLICY == "none":
-        cached_file = None
-    else:
-        cached_file = cache.get(filename)
+    if not is_safe_filename(filename):
+        return {"error": "Invalid filename"}, 400
+
+    with lock:
+
+        # Snapshot shared state for the whole request
+        request_cache = cache
+        policy = CACHE_POLICY
+        request_generation = generation
+
+        # request_cache is None when caching is disabled
+        if request_cache is None:
+            cached_file = None
+        else:
+            cached_file = request_cache.get(filename)
+
+        if cached_file is not None:
+            stats["hits"] += 1
+        else:
+            # Count requests sent to Origin Server
+            stats["origin_requests"] += 1
 
     # CACHE HIT
     if cached_file is not None:
-
-        stats["hits"] += 1
 
         print(f"CACHE HIT: {filename}", flush=True)
 
@@ -70,46 +107,46 @@ def get_content(filename):
             content_type=content_type,
             headers={
                 "X-Cache": "HIT",
-                "X-Cache-Policy": CACHE_POLICY
+                "X-Cache-Policy": policy
             }
         )
 
     # CACHE MISS
-    stats["misses"] += 1
-
     print(f"CACHE MISS: {filename}", flush=True)
 
-    url = f"{ORIGIN_URL}/content/{filename}"
+    url = f"{ORIGIN_URL}/content/{quote(filename, safe='/')}"
 
     try:
-        # Count requests sent to Origin Server
-        stats["origin_requests"] += 1
-
+        # The lock is not held during network I/O
         origin_response = requests.get(
             url,
             timeout=10
         )
-
-        # Measure received content size
-        stats["origin_bytes"] += len(origin_response.content)
 
         content_type = origin_response.headers.get(
             "Content-Type",
             "application/octet-stream"
         )
 
-        # Store successful responses only when caching is enabled
-        if (
-            origin_response.status_code == 200
-            and CACHE_POLICY != "none"
-        ):
-            cache.put(
-                filename,
-                (
-                    origin_response.content,
-                    content_type
-                )
-            )
+        # Only successful responses count as cacheable traffic
+        if origin_response.status_code == 200:
+
+            with lock:
+
+                # Skip if a reset happened during the fetch
+                if request_generation == generation:
+
+                    stats["misses"] += 1
+                    stats["origin_bytes"] += len(origin_response.content)
+
+                    if request_cache is not None:
+                        request_cache.put(
+                            filename,
+                            (
+                                origin_response.content,
+                                content_type
+                            )
+                        )
 
         return Response(
             origin_response.content,
@@ -117,7 +154,7 @@ def get_content(filename):
             content_type=content_type,
             headers={
                 "X-Cache": "MISS",
-                "X-Cache-Policy": CACHE_POLICY
+                "X-Cache-Policy": policy
             }
         )
 
@@ -135,8 +172,12 @@ def get_content(filename):
 @app.route("/stats")
 def get_stats():
 
-    hits = stats["hits"]
-    misses = stats["misses"]
+    with lock:
+        snapshot = dict(stats)
+        policy = CACHE_POLICY
+
+    hits = snapshot["hits"]
+    misses = snapshot["misses"]
 
     total = hits + misses
 
@@ -146,13 +187,13 @@ def get_stats():
         hit_rate = (hits / total) * 100
 
     return {
-        "cache_policy": CACHE_POLICY,
+        "cache_policy": policy,
         "total_requests": total,
         "cache_hits": hits,
         "cache_misses": misses,
         "cache_hit_rate": round(hit_rate, 2),
-        "origin_requests": stats["origin_requests"],
-        "origin_bytes": stats["origin_bytes"]
+        "origin_requests": snapshot["origin_requests"],
+        "origin_bytes": snapshot["origin_bytes"]
     }
 
 
@@ -163,7 +204,7 @@ def get_stats():
 @app.route("/admin/reset", methods=["POST"])
 def reset_cache():
 
-    global cache, CACHE_POLICY
+    global cache, CACHE_POLICY, generation
 
     # Local testing only
     if request.remote_addr not in ("127.0.0.1", "::1"):
@@ -171,7 +212,12 @@ def reset_cache():
             "error": "Local access only"
         }, 403
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        return {
+            "error": "JSON object required"
+        }, 400
 
     policy = data.get("policy")
 
@@ -181,23 +227,26 @@ def reset_cache():
             "error": "Invalid cache policy"
         }, 400
 
-    # Change algorithm and clear cache
-    cache = create_cache(policy)
+    with lock:
 
-    CACHE_POLICY = policy
+        # Change algorithm and clear cache
+        cache = create_cache(policy)
 
-    # Reset all statistics
-    for key in stats:
-        stats[key] = 0
+        CACHE_POLICY = policy
+        generation += 1
+
+        # Reset all statistics
+        for key in stats:
+            stats[key] = 0
 
     print(
-        f"CACHE RESET | Policy: {CACHE_POLICY}",
+        f"CACHE RESET | Policy: {policy}",
         flush=True
     )
 
     return {
         "status": "reset",
-        "cache_policy": CACHE_POLICY,
+        "cache_policy": policy,
         "cache_capacity": CACHE_CAPACITY
     }
 
@@ -213,36 +262,31 @@ def get_cache_contents():
     if request.remote_addr not in ("127.0.0.1", "::1"):
         return {"error": "Local access only"}, 403
 
-    # No Cache mode
-    if CACHE_POLICY == "none":
-        return {
-            "cache_policy": CACHE_POLICY,
-            "capacity": CACHE_CAPACITY,
-            "item_count": 0,
-            "items": []
-        }
-
     items = []
 
-    # LRU: Ordered from oldest to newest
-    if CACHE_POLICY == "lru":
+    with lock:
 
-        for filename in cache.cache.keys():
-            items.append({
-                "filename": filename
-            })
+        policy = CACHE_POLICY
 
-    # LFU: Show access frequency
-    elif CACHE_POLICY == "popularity":
+        # LRU: Ordered from oldest to newest
+        if policy == "lru":
 
-        for filename in cache.cache.keys():
-            items.append({
-                "filename": filename,
-                "frequency": cache.frequency[filename]
-            })
+            for filename in cache.cache.keys():
+                items.append({
+                    "filename": filename
+                })
+
+        # LFU: Show access frequency
+        elif policy == "popularity":
+
+            for filename in cache.cache.keys():
+                items.append({
+                    "filename": filename,
+                    "frequency": cache.frequency[filename]
+                })
 
     return {
-        "cache_policy": CACHE_POLICY,
+        "cache_policy": policy,
         "capacity": CACHE_CAPACITY,
         "item_count": len(items),
         "items": items
@@ -256,5 +300,5 @@ if __name__ == "__main__":
     app.run(
         host="127.0.0.1",
         port=5001,
-        debug=True
+        debug=False
     )

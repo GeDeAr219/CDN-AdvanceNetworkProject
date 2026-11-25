@@ -14,7 +14,10 @@ from workload import (
 
 EDGE_URL = "http://127.0.0.1:5001"
 POLICIES = ["lru", "popularity", "none"]
-REPEAT_COUNT = 3
+REPEAT_COUNT = 10
+
+# Policy the edge server is left on after the benchmark
+DEFAULT_POLICY = "lru"
 
 # Use larger binary files for testing
 SCENARIOS = {
@@ -47,10 +50,50 @@ def reset_server(policy):
     if data["cache_policy"] != policy:
         raise RuntimeError("Cache policy reset failed")
 
+    # Confirm that statistics and cache are really empty
+    stats = get_edge_json("/stats")
+    cache_info = get_edge_json("/cache")
+
+    counters = (
+        "total_requests",
+        "origin_requests",
+        "origin_bytes"
+    )
+
+    if any(stats[key] != 0 for key in counters) or cache_info["items"]:
+        raise RuntimeError(
+            "Edge not clean after reset (is other traffic running?)"
+        )
+
+
+def get_edge_json(path):
+
+    response = requests.get(
+        f"{EDGE_URL}{path}",
+        timeout=10
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def warm_up(files):
+
+    # Request each file once so first-time costs are not measured
+    for filename in sorted(set(files)):
+
+        response = requests.get(
+            f"{EDGE_URL}/content/{filename}",
+            timeout=10
+        )
+        response.raise_for_status()
+
 
 def run_test(policy, scenario, files, run_number):
 
-    # Start each experiment with an empty cache
+    reset_server(policy)
+    warm_up(files)
+
+    # Start each experiment with an empty cache and zero statistics
     reset_server(policy)
 
     latencies = []
@@ -81,12 +124,7 @@ def run_test(policy, scenario, files, run_number):
         latencies.append(latency)
 
     # Read server measurements
-    response = requests.get(
-        f"{EDGE_URL}/stats",
-        timeout=10
-    )
-    response.raise_for_status()
-    stats = response.json()
+    stats = get_edge_json("/stats")
 
     if (
         stats["total_requests"] != len(files)
@@ -110,7 +148,18 @@ def run_test(policy, scenario, files, run_number):
     }
 
 
-def main():
+def restore_default_policy():
+
+    try:
+        reset_server(DEFAULT_POLICY)
+        print(f"Edge restored to policy: {DEFAULT_POLICY}")
+
+    # Do not hide the error that stopped the benchmark
+    except (requests.RequestException, RuntimeError, ValueError) as error:
+        print(f"WARNING: Could not restore edge policy: {error}")
+
+
+def run_all():
 
     results = []
 
@@ -132,6 +181,17 @@ def main():
                     f"Hit Rate: {result['hit_rate']}% | "
                     f"Latency: {result['average_latency_ms']} ms"
                 )
+
+    return results
+
+
+def main():
+
+    # Restore the edge server even if a run fails or is interrupted
+    try:
+        results = run_all()
+    finally:
+        restore_default_policy()
 
     # Save measurements to CSV
     results_dir = Path(__file__).resolve().parent.parent / "results"
